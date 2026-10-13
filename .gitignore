@@ -4,3 +4,5 @@
 ynab-mcp
 bin/
 *.test
+*.db
+*.db.lock

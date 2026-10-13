@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: budget-tools-for-ynab
+    runtime: docker
+    plan: 0.5c-512mb
+    healthCheckPath: /healthz
+    disk:
+      name: oauth-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: MCP_TRANSPORT
+        value: http
+      - key: OAUTH_DB_PATH
+        value: /data/oauth.db
+      - key: PUBLIC_BASE_URL
+        sync: false
+      - key: YNAB_OAUTH_CLIENT_ID
+        sync: false
+      - key: YNAB_OAUTH_CLIENT_SECRET
+        sync: false
+      - key: TOKEN_ENCRYPTION_KEY
+        sync: false
