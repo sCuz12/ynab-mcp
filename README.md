@@ -16,14 +16,13 @@ go build -o bin/ynab-mcp .
 YNAB_ACCESS_TOKEN='your-token' ./bin/ynab-mcp
 ```
 
-For local development with a `.env` file containing `YNAB_ACCESS_TOKEN=...`, export its variables before starting Go:
+For local development, put `YNAB_ACCESS_TOKEN=...` in a `.env` file in the directory where you start the server, then run:
 
 ```sh
-set -a
-source .env
-set +a
-go run .
+MCP_TRANSPORT=stdio go run .
 ```
+
+The server loads `.env` automatically when present. Environment variables already set by your shell or hosting service take precedence. A missing `.env` file is fine.
 
 The process reads newline-delimited MCP JSON-RPC messages on stdin and writes responses on stdout. It does not print a startup message. For an MCP host, configure an absolute path to the built binary and supply the token through the host's private environment settings. For example:
 

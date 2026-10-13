@@ -6,13 +6,13 @@
 
 ## Build, Test, and Development Commands
 
-- `go run .` starts the stdio server; it waits for MCP messages on stdin.
+- `MCP_TRANSPORT=stdio go run .` starts the stdio server; it waits for MCP messages on stdin.
 - `MCP_TRANSPORT=http go run .` starts hosted mode when its OAuth environment variables are set; see `README.md`.
 - `go build -o bin/ynab-mcp .` builds a local binary. `bin/` is ignored by Git.
 - `go test ./...` runs protocol, tool, and mocked API tests.
 - `go vet ./...` runs static checks; `gofmt -w main.go internal/*/*.go` formats Go source.
 
-Set `YNAB_ACCESS_TOKEN` for local stdio mode. Hosted mode uses YNAB OAuth variables and a persistent database. For a local `.env` file, use `set -a; source .env; set +a`; Go does not load it automatically.
+Set `YNAB_ACCESS_TOKEN` for local stdio mode. Hosted mode uses YNAB OAuth variables and a persistent database. `main.go` loads an optional `.env` file from the working directory; existing environment variables take precedence.
 
 ## Coding Style & Naming Conventions
 
