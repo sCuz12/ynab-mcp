@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"time"
@@ -20,6 +21,7 @@ func main() {
 		log.Fatal(err)
 	}
 	if os.Getenv("MCP_TRANSPORT") == "http" {
+		slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
 		s, err := hosted.New(hosted.Config{
 			BaseURL: os.Getenv("PUBLIC_BASE_URL"), YNABClientID: os.Getenv("YNAB_OAUTH_CLIENT_ID"),
 			YNABSecret: os.Getenv("YNAB_OAUTH_CLIENT_SECRET"), DBPath: os.Getenv("OAUTH_DB_PATH"), Key: os.Getenv("TOKEN_ENCRYPTION_KEY"),

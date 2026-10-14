@@ -1,10 +1,12 @@
 package hosted
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -180,5 +182,72 @@ func TestReadOnlyGrantHidesWriteTools(t *testing.T) {
 	s.Handler().ServeHTTP(w, r)
 	if w.Code != 200 || !strings.Contains(w.Body.String(), "list_transactions") || strings.Contains(w.Body.String(), "create_transaction") {
 		t.Fatalf("read-only tools: %d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestInvalidStateLogsReasonWithoutStateValue(t *testing.T) {
+	s := testService(t)
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	state := "secret-state-that-must-not-appear-in-logs"
+	response := request(t, s.Handler(), "GET", "/oauth/ynab/callback?state="+url.QueryEscape(state), "")
+	if response.Code != 400 || response.Header().Get("X-Request-ID") == "" {
+		t.Fatalf("invalid state response: status=%d request_id=%q", response.Code, response.Header().Get("X-Request-ID"))
+	}
+	output := logs.String()
+	if !strings.Contains(output, `"reason":"unknown_or_used_state"`) || !strings.Contains(output, stateRef(state)) || !strings.Contains(output, response.Header().Get("X-Request-ID")) {
+		t.Fatalf("missing safe diagnostic fields: %s", output)
+	}
+	if strings.Contains(output, state) || strings.Contains(output, "?state=") {
+		t.Fatalf("OAuth state leaked to logs: %s", output)
+	}
+
+	logs.Reset()
+	expired := "expired-secret-state"
+	if err := s.store.put("pending", digest(expired), pending{Expires: time.Now().Add(-time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	response = request(t, s.Handler(), "GET", "/oauth/ynab/callback?state="+url.QueryEscape(expired), "")
+	if response.Code != 400 || !strings.Contains(logs.String(), `"reason":"expired_state"`) || strings.Contains(logs.String(), expired) {
+		t.Fatalf("expired state diagnostic: status=%d logs=%s", response.Code, logs.String())
+	}
+}
+
+func TestToolLogOmitsYNABResponseAndCredentials(t *testing.T) {
+	s := testService(t)
+	access := "mcp-secret-access"
+	grant := mcpToken{Resource: s.resource(), Scope: "ynab:read", UserID: "user-1", Expires: time.Now().Add(time.Hour)}
+	if err := s.store.put("access", digest(access), grant); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.store.put("ynab", digest("user-1:ynab:read"), ynabCredential{Access: "ynab-access", Refresh: "ynab-refresh", Expires: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	r := httptest.NewRequest("POST", "/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_plans","arguments":{}}}`))
+	r.Header.Set("Authorization", "Bearer "+access)
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("Accept", "application/json, text/event-stream")
+	r.Header.Set("MCP-Protocol-Version", "2025-11-25")
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, r)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), "plan-1") {
+		t.Fatalf("tool response: %d %s", w.Code, w.Body.String())
+	}
+	output := logs.String()
+	if !strings.Contains(output, `"msg":"mcp_tool"`) || !strings.Contains(output, `"tool":"list_plans"`) {
+		t.Fatalf("missing tool event: %s", output)
+	}
+	for _, secret := range []string{access, "ynab-access", "ynab-refresh", "plan-1"} {
+		if strings.Contains(output, secret) {
+			t.Fatalf("sensitive value appeared in logs: %s", secret)
+		}
 	}
 }

@@ -142,11 +142,13 @@ func (s *Service) register(w http.ResponseWriter, r *http.Request) {
 	}
 	var client oauthClient
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32<<10)).Decode(&client); err != nil || len(client.RedirectURIs) == 0 || len(client.RedirectURIs) > 10 {
+		logOutcome(r, "oauth_register", "rejected", "invalid_client_metadata")
 		oauthError(w, 400, "invalid_client_metadata")
 		return
 	}
 	for _, redirect := range client.RedirectURIs {
 		if !validRedirect(redirect) {
+			logOutcome(r, "oauth_register", "rejected", "invalid_redirect_uri")
 			oauthError(w, 400, "invalid_redirect_uri")
 			return
 		}
@@ -157,9 +159,11 @@ func (s *Service) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.store.put("clients", id, client); err != nil {
+		logOutcome(r, "oauth_register", "failed", "storage_error")
 		http.Error(w, "internal error", 500)
 		return
 	}
+	logOutcome(r, "oauth_register", "succeeded", "client_registered")
 	jsonReply(w, http.StatusCreated, map[string]any{"client_id": id, "client_id_issued_at": time.Now().Unix(), "redirect_uris": client.RedirectURIs, "client_name": client.ClientName, "token_endpoint_auth_method": "none"})
 }
 
@@ -193,6 +197,7 @@ func (s *Service) authorize(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	var client oauthClient
 	if err := s.store.get("clients", q.Get("client_id"), &client); err != nil {
+		logOutcome(r, "oauth_authorize", "rejected", "invalid_client")
 		oauthError(w, 400, "invalid_client")
 		return
 	}
@@ -204,15 +209,18 @@ func (s *Service) authorize(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if !allowed {
+		logOutcome(r, "oauth_authorize", "rejected", "invalid_redirect_uri")
 		oauthError(w, 400, "invalid_redirect_uri")
 		return
 	}
 	if q.Get("response_type") != "code" || q.Get("code_challenge_method") != "S256" || !validChallenge(q.Get("code_challenge")) || q.Get("resource") != s.resource() {
+		logOutcome(r, "oauth_authorize", "rejected", "invalid_request")
 		oauthError(w, 400, "invalid_request")
 		return
 	}
 	scope, valid := normalizeScope(q.Get("scope"))
 	if !valid {
+		logOutcome(r, "oauth_authorize", "rejected", "invalid_scope")
 		oauthError(w, 400, "invalid_scope")
 		return
 	}
@@ -228,9 +236,11 @@ func (s *Service) authorize(w http.ResponseWriter, r *http.Request) {
 	}
 	p := pending{ClientID: q.Get("client_id"), RedirectURI: redirect, State: q.Get("state"), Challenge: q.Get("code_challenge"), Resource: s.resource(), Scope: scope, YNABVerifier: verifier, Expires: time.Now().Add(10 * time.Minute)}
 	if err := s.store.put("pending", digest(id), p); err != nil {
+		logStateOutcome(r, "failed", "storage_error", id)
 		http.Error(w, "internal error", 500)
 		return
 	}
+	logStateOutcome(r, "created", "ynab_redirect", id)
 	u, _ := url.Parse(s.cfg.YNABAuthURL)
 	y := u.Query()
 	y.Set("client_id", s.cfg.YNABClientID)
@@ -248,16 +258,34 @@ func (s *Service) authorize(w http.ResponseWriter, r *http.Request) {
 
 func (s *Service) callback(w http.ResponseWriter, r *http.Request) {
 	var p pending
-	if err := s.store.take("pending", digest(r.URL.Query().Get("state")), &p); err != nil || time.Now().After(p.Expires) {
+	state := r.URL.Query().Get("state")
+	if state == "" {
+		logStateOutcome(r, "rejected", "missing_state", state)
+		oauthError(w, 400, "invalid_state")
+		return
+	}
+	if err := s.store.take("pending", digest(state), &p); err != nil {
+		if errors.Is(err, errMissing) {
+			logStateOutcome(r, "rejected", "unknown_or_used_state", state)
+		} else {
+			logStateOutcome(r, "failed", "storage_error", state)
+		}
+		oauthError(w, 400, "invalid_state")
+		return
+	}
+	if time.Now().After(p.Expires) {
+		logStateOutcome(r, "rejected", "expired_state", state)
 		oauthError(w, 400, "invalid_state")
 		return
 	}
 	if r.URL.Query().Get("error") != "" {
+		logStateOutcome(r, "rejected", "ynab_access_denied", state)
 		oauthError(w, 400, "access_denied")
 		return
 	}
 	code := r.URL.Query().Get("code")
 	if code == "" {
+		logStateOutcome(r, "rejected", "missing_code", state)
 		oauthError(w, 400, "invalid_request")
 		return
 	}
@@ -265,15 +293,18 @@ func (s *Service) callback(w http.ResponseWriter, r *http.Request) {
 		"grant_type": {"authorization_code"}, "code": {code}, "redirect_uri": {s.cfg.BaseURL + "/oauth/ynab/callback"}, "code_verifier": {p.YNABVerifier},
 	})
 	if err != nil {
+		logStateOutcome(r, "failed", "ynab_token_exchange", state)
 		http.Error(w, "YNAB authorization failed", 502)
 		return
 	}
 	userID, err := s.ynabUser(r.Context(), credential.Access)
 	if err != nil {
+		logStateOutcome(r, "failed", "ynab_user_lookup", state)
 		http.Error(w, "YNAB user lookup failed", 502)
 		return
 	}
 	if err := s.store.put("ynab", digest(userID+":"+p.Scope), credential); err != nil {
+		logStateOutcome(r, "failed", "storage_error", state)
 		http.Error(w, "internal error", 500)
 		return
 	}
@@ -284,6 +315,7 @@ func (s *Service) callback(w http.ResponseWriter, r *http.Request) {
 	}
 	a := authorizationCode{ClientID: p.ClientID, RedirectURI: p.RedirectURI, Challenge: p.Challenge, Resource: p.Resource, Scope: p.Scope, UserID: userID, Expires: time.Now().Add(5 * time.Minute)}
 	if err := s.store.put("codes", digest(outCode), a); err != nil {
+		logStateOutcome(r, "failed", "storage_error", state)
 		http.Error(w, "internal error", 500)
 		return
 	}
@@ -293,6 +325,7 @@ func (s *Service) callback(w http.ResponseWriter, r *http.Request) {
 	q.Set("state", p.State)
 	q.Set("iss", s.cfg.BaseURL)
 	u.RawQuery = q.Encode()
+	logStateOutcome(r, "completed", "client_redirect", state)
 	http.Redirect(w, r, u.String(), http.StatusFound)
 }
 
@@ -371,6 +404,7 @@ func (s *Service) token(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 32<<10)
 	if err := r.ParseForm(); err != nil {
+		logOutcome(r, "oauth_token", "rejected", "invalid_request")
 		oauthError(w, 400, "invalid_request")
 		return
 	}
@@ -381,6 +415,7 @@ func (s *Service) token(w http.ResponseWriter, r *http.Request) {
 		if err := s.store.takeIf("codes", digest(r.Form.Get("code")), &code, func() bool {
 			return time.Now().Before(code.Expires) && code.ClientID == r.Form.Get("client_id") && code.RedirectURI == r.Form.Get("redirect_uri") && code.Resource == r.Form.Get("resource") && verifyPKCE(r.Form.Get("code_verifier"), code.Challenge)
 		}); err != nil {
+			logOutcome(r, "oauth_token", "rejected", "invalid_authorization_code_grant")
 			oauthError(w, 400, "invalid_grant")
 			return
 		}
@@ -389,10 +424,12 @@ func (s *Service) token(w http.ResponseWriter, r *http.Request) {
 		if err := s.store.takeIf("refresh", digest(r.Form.Get("refresh_token")), &t, func() bool {
 			return time.Now().Before(t.Expires) && t.ClientID == r.Form.Get("client_id") && t.Resource == r.Form.Get("resource")
 		}); err != nil {
+			logOutcome(r, "oauth_token", "rejected", "invalid_refresh_grant")
 			oauthError(w, 400, "invalid_grant")
 			return
 		}
 	default:
+		logOutcome(r, "oauth_token", "rejected", "unsupported_grant_type")
 		oauthError(w, 400, "unsupported_grant_type")
 		return
 	}
@@ -408,14 +445,17 @@ func (s *Service) token(w http.ResponseWriter, r *http.Request) {
 	}
 	t.Expires = time.Now().Add(time.Hour)
 	if err := s.store.put("access", digest(access), t); err != nil {
+		logOutcome(r, "oauth_token", "failed", "storage_error")
 		http.Error(w, "internal error", 500)
 		return
 	}
 	t.Expires = time.Now().Add(30 * 24 * time.Hour)
 	if err := s.store.put("refresh", digest(refresh), t); err != nil {
+		logOutcome(r, "oauth_token", "failed", "storage_error")
 		http.Error(w, "internal error", 500)
 		return
 	}
+	logOutcome(r, "oauth_token", "issued", "grant_completed")
 	jsonReply(w, 200, map[string]any{"access_token": access, "refresh_token": refresh, "token_type": "Bearer", "expires_in": 3600, "scope": t.Scope})
 }
 
